@@ -10,19 +10,24 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 DATA_FILE = "user_codespaces.json"
 APPROVED_USERS_FILE = "approved_users.json"
 
+def load_json_file(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            content = f.read().strip()
+            if not content:
+                return default
+            return json.loads(content)
+    except (json.JSONDecodeError, IOError):
+        return default
+
 # Load stored codespace data
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        USER_DATA = json.load(f)
-else:
-    USER_DATA = {}
+USER_DATA = load_json_file(DATA_FILE, {})
 
 # Load approved users
-if os.path.exists(APPROVED_USERS_FILE):
-    with open(APPROVED_USERS_FILE, "r") as f:
-        APPROVED_USERS = json.load(f)
-else:
-    APPROVED_USERS = [5722584981]  # Add your user ID manually
+APPROVED_USERS = load_json_file(APPROVED_USERS_FILE, [])
+if not os.path.exists(APPROVED_USERS_FILE):
     with open(APPROVED_USERS_FILE, "w") as f:
         json.dump(APPROVED_USERS, f)
 
@@ -157,6 +162,9 @@ async def approve_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- BACKGROUND MONITOR ---
 
 def monitor_codespaces(bot_app):
+    stopped_states = {"Stopped", "Offline", "Unavailable"}
+    skip_states = {"Available", "Starting", "Provisioning", "Stopping"}
+
     while True:
         print("🔁 Checking Codespaces...")
         for user_id, items in USER_DATA.items():
@@ -172,22 +180,28 @@ def monitor_codespaces(bot_app):
                     if resp.status_code == 200:
                         state = resp.json().get("state")
                         print(f"[{name}] → {state}")
-                        if state != "Available":
-                            print(f"⚡ Starting {name}...")
+                        if state in stopped_states:
+                            print(f"⚡ Starting stopped codespace {name}...")
                             start_url = f"https://api.github.com/user/codespaces/{name}/start"
                             start_resp = requests.post(start_url, headers=github_headers(token))
-                            if start_resp.status_code == 202:
+                            if start_resp.status_code in (200, 202):
                                 print(f"✅ Started {name}")
                                 try:
                                     bot_app.bot.send_message(chat_id=chat_id,
-                                        text=f"✅ Codespace `{name}` was offline and is now starting.",
+                                        text=f"✅ Codespace `{name}` was stopped and is now starting.",
                                         parse_mode="Markdown")
                                 except Exception as e:
                                     print(f"❌ Telegram error: {e}")
                             else:
-                                print(f"❌ Start failed: {start_resp.text}")
+                                print(f"❌ Start failed: {start_resp.status_code} {start_resp.text}")
+                        elif state in skip_states:
+                            print(f"ℹ️ No action needed for {name} ({state}).")
+                        else:
+                            print(f"⚠️ Unknown state for {name}: {state}. Skipping start.")
+                    elif resp.status_code == 404:
+                        print(f"❌ Codespace not found: {name}")
                     else:
-                        print(f"❌ Failed to fetch {name}: {resp.status_code}")
+                        print(f"❌ Failed to fetch {name}: {resp.status_code} {resp.text}")
                 except Exception as e:
                     print(f"❌ Error checking {name}: {e}")
         time.sleep(60)
