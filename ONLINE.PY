@@ -1,4 +1,6 @@
+import hashlib
 import os
+import sys
 import json
 import time
 import requests
@@ -8,6 +10,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # --- DATA FILES ---
 DATA_FILE = "user_codespaces.json"
+TOKEN_FILE = "user_tokens.json"
 APPROVED_USERS_FILE = "approved_users.json"
 
 def load_json_file(path, default):
@@ -22,8 +25,35 @@ def load_json_file(path, default):
     except (json.JSONDecodeError, IOError):
         return default
 
+
+def token_id(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def migrate_user_data(raw_data):
+    migrated = False
+    output = {}
+    for user_id, items in raw_data.items():
+        output[user_id] = []
+        for item in items:
+            if "token" in item:
+                tid = token_id(item["token"])
+                USER_TOKENS.setdefault(tid, item["token"])
+                output[user_id].append({
+                    "token_id": tid,
+                    "codespace": item["codespace"],
+                    "chat_id": item["chat_id"]
+                })
+                migrated = True
+            else:
+                output[user_id].append(item)
+    if migrated:
+        save_tokens()
+    return output
+
 # Load stored codespace data
-USER_DATA = load_json_file(DATA_FILE, {})
+USER_TOKENS = load_json_file(TOKEN_FILE, {})
+USER_DATA = migrate_user_data(load_json_file(DATA_FILE, {}))
 
 # Load approved users
 APPROVED_USERS = load_json_file(APPROVED_USERS_FILE, [])
@@ -37,6 +67,12 @@ def save_data():
     with open(DATA_FILE, "w") as f:
         json.dump(USER_DATA, f)
 
+
+def save_tokens():
+    with open(TOKEN_FILE, "w") as f:
+        json.dump(USER_TOKENS, f)
+
+
 def save_approved_users():
     with open(APPROVED_USERS_FILE, "w") as f:
         json.dump(APPROVED_USERS, f)
@@ -47,7 +83,7 @@ def github_headers(token):
         "Accept": "application/vnd.github+json"
     }
 
-def add_codespace(user_id, token, codespace_name, chat_id):
+def add_codespace(user_id, token_id_value, codespace_name, chat_id):
     user_id = str(user_id)
     if user_id not in USER_DATA:
         USER_DATA[user_id] = []
@@ -55,7 +91,7 @@ def add_codespace(user_id, token, codespace_name, chat_id):
         if item["codespace"] == codespace_name:
             return
     USER_DATA[user_id].append({
-        "token": token,
+        "token_id": token_id_value,
         "codespace": codespace_name,
         "chat_id": chat_id
     })
@@ -111,10 +147,15 @@ async def add_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 No codespaces found for this token.")
         return
 
+    tid = token_id(token)
+    if tid not in USER_TOKENS:
+        USER_TOKENS[tid] = token
+        save_tokens()
+
     added = []
     for cs in data["codespaces"]:
         name = cs["name"]
-        add_codespace(user_id, token, name, chat_id)
+        add_codespace(user_id, tid, name, chat_id)
         added.append(name)
 
     msg = "✅ Registered the following codespaces:\n"
@@ -169,9 +210,14 @@ def monitor_codespaces(bot_app):
         print("🔁 Checking Codespaces...")
         for user_id, items in USER_DATA.items():
             for entry in items:
-                token = entry["token"]
+                token_id_value = entry.get("token_id")
+                token = USER_TOKENS.get(token_id_value)
                 name = entry["codespace"]
                 chat_id = entry["chat_id"]
+
+                if not token:
+                    print(f"❌ Missing token for codespace {name} (token_id={token_id_value}).")
+                    continue
 
                 # Check status
                 url = f"https://api.github.com/user/codespaces/{name}"
